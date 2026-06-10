@@ -1,0 +1,115 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: aws-s3-upload
+  title: AWS S3 — Subir archivos
+  description: >-
+    Sube archivos a un bucket S3 existente. Elige bucket, carpeta existente o raíz,
+    o crea una carpeta nueva y sube los archivos dentro. Usa «AWS S3 Bucket» si
+    aún no tienes bucket.
+  tags:
+    - idp-cloud-aws
+    - aws
+    - s3
+    - upload
+spec:
+  owner: group:devops
+  type: service
+
+  parameters:
+    - title: Destino en AWS
+      required:
+        - awsAccountId
+        - awsRegion
+        - bucketName
+        - folderMode
+        - files
+      properties:
+        awsAccountId:
+          title: AWS Account ID
+          type: string
+          minLength: 12
+          maxLength: 12
+          pattern: '^[0-9]{12}$'
+        awsRegion:
+          title: AWS Region
+          type: string
+          default: us-east-2
+        bucketName:
+          title: Bucket S3
+          type: string
+          ui:field: AwsS3TargetBucketPicker
+          ui:options:
+            label: false
+        folderMode:
+          title: Carpeta de destino
+          type: string
+          enum:
+            - existing
+            - new
+          default: existing
+          ui:enumNames:
+            - Usar carpeta existente o raíz del bucket
+            - Crear carpeta nueva y subir archivos ahí
+        folderPath:
+          title: Ruta de carpeta
+          type: string
+          default: ''
+          ui:field: AwsS3FolderPicker
+          ui:options:
+            label: false
+        files:
+          title: Archivos a subir
+          type: array
+          default: []
+          ui:field: AwsS3FileUpload
+          ui:options:
+            label: false
+
+  steps:
+    - id: upload-objects
+      name: Subir a S3
+      action: aws:s3:uploadObjects
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        bucketName: ${{ parameters.bucketName }}
+        folderPath: ${{ parameters.folderPath }}
+        createFolderMarker: ${{ parameters.folderMode == 'new' and (parameters.folderPath | length > 0) }}
+        files: ${{ parameters.files }}
+
+    - id: record-resource
+      name: Registrar en IDP
+      action: internal:resources:record
+      input:
+        platform: aws
+        resourceType: s3-upload
+        name: ${{ parameters.bucketName }}
+        region: ${{ parameters.awsRegion }}
+        accountId: ${{ parameters.awsAccountId }}
+        owner: group:devops
+        metadata:
+          folderPath: ${{ parameters.folderPath }}
+          folderMode: ${{ parameters.folderMode }}
+          keys: ${{ steps['upload-objects'].output.uploadedKeys }}
+
+  output:
+    links:
+      - title: Consola S3 — bucket
+        url: https://${{ parameters.awsRegion }}.console.aws.amazon.com/s3/buckets/${{ parameters.bucketName }}?region=${{ parameters.awsRegion }}
+    text:
+      - title: Objetos subidos
+        content: |
+          **Bucket:** `${{ parameters.bucketName }}`
+          **Región:** `${{ parameters.awsRegion }}`
+          **Carpeta:** `${{ parameters.folderPath || '(raíz del bucket)' }}`
+          **Modo carpeta:** `${{ parameters.folderMode }}`
+
+          Claves S3:
+          ${{ steps['upload-objects'].output.uploadedKeys | join('\n') }}
+
+          URIs:
+          ${{ steps['upload-objects'].output.s3Uris | join('\n') }}
+
+          URLs HTTP (si el bucket es público y tiene política de lectura):
+          ${{ steps['upload-objects'].output.httpUrls | join('\n') }}
