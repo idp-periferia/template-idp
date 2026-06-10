@@ -1,0 +1,746 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: aws-codebuild-ci-pipeline
+  title: AWS CodeCommit + CodeBuild CI Pipeline
+  description: >-
+    Crea CodeCommit, ECR, rol IAM y proyecto CodeBuild (CodeCommit, rama main,
+    imagen amazonlinux-x86_64-standard:6.0). Opcionalmente crea un bucket S3
+    para artefactos; si no, el proyecto CodeBuild queda sin artefactos S3
+    (NO_ARTIFACTS). El usuario IAM de Backstage necesita permisos Cloud Control
+    (ECR, IAM, S3), codebuild:CreateProject para el proyecto, y para roles
+    acciones como iam:GetRole e iam:CreateRole sobre el rol del proyecto
+    (p. ej. <repo>-cb-role).
+  tags:
+    - idp-cloud-aws
+    - aws
+    - ci-cd
+    - docker
+    - ecr
+    - codebuild
+spec:
+  owner: platform-team
+  type: pipeline
+
+  parameters:
+    - title: Project Information
+      required:
+        - projectName
+        - repositoryName
+        - language
+      properties:
+        projectName:
+          title: Project Name
+          type: string
+          description: >-
+            Nombre del proyecto CodeBuild (sin espacios; alfanumérico, guiones
+            y guiones bajos; 2–150 caracteres según AWS).
+          ui:autofocus: true
+          pattern: '^[A-Za-z0-9][A-Za-z0-9\-_]{1,149}$'
+        repositoryName:
+          title: Repository Name
+          type: string
+          description: >-
+            Nombre para CodeCommit y ECR (reglas de naming de AWS para ambos).
+          maxLength: 100
+          pattern: '^[a-zA-Z0-9._-]+$'
+        description:
+          title: Description
+          type: string
+          description: Short pipeline description
+          ui:widget: textarea
+          ui:options:
+            minRows: 3
+        language:
+          title: Programming Language
+          type: string
+          description: Main project language
+          enum:
+            - nodejs
+            - csharp
+            - java
+            - python
+          ui:enumNames:
+            - Node.js
+            - C#/.NET
+            - Java
+            - Python
+
+    - title: Pipeline Configuration
+      required:
+        - buildTrigger
+        - buildSteps
+      properties:
+        buildTrigger:
+          title: Build Trigger
+          type: string
+          description: >-
+            Rama principal esperada en CodeCommit (el proyecto CodeBuild usa
+            rama main como referencia de origen).
+          enum:
+            - main
+            - develop
+            - feature/*
+            - manual
+          ui:enumNames:
+            - Push to main
+            - Push to develop
+            - Push to feature branches
+            - Manual only
+          default: main
+        buildSteps:
+          title: Build Steps
+          type: array
+          description: Select the steps your pipeline requires
+          items:
+            type: string
+            enum:
+              - install-dependencies
+              - run-tests
+              - build-application
+              - security-scan
+              - docker-build
+              - publish-artifacts
+          uniqueItems: true
+          default: ["install-dependencies", "run-tests", "build-application"]
+
+    - title: AWS Configuration
+      required:
+        - awsAccountId
+        - awsRegion
+        - artifactBucketMode
+      properties:
+        awsAccountId:
+          title: AWS Account ID
+          type: string
+          description: >-
+            Escribe solo los 12 dígitos del ID de cuenta (sin espacios ni URLs).
+          minLength: 12
+          maxLength: 12
+          pattern: '^[0-9]{12}$'
+        awsRegion:
+          title: AWS Region
+          type: string
+          description: Región para CodeCommit, ECR, S3, IAM y CodeBuild (también para listar buckets)
+          default: us-east-2
+        artifactBucketMode:
+          title: Artefactos de CodeBuild en S3
+          type: string
+          description: >-
+            Crear bucket: Backstage crea el bucket (requiere permisos S3 en el
+            usuario del backend). Sin bucket: proyecto sin artefactos S3
+            (NO_ARTIFACTS). Usar existente: eliges un bucket de la lista (API
+            ListBuckets con credenciales del backend).
+          enum:
+            - create
+            - none
+            - existing
+          ui:enumNames:
+            - Crear bucket nuevo
+            - Sin bucket (NO_ARTIFACTS)
+            - Usar bucket ya existente
+          ui:widget: radio
+          default: none
+        artifactBucketAccess:
+          type: string
+          title: Visibilidad del bucket (solo al crear uno nuevo)
+          description: >-
+            Solo se usa si eliges crear un bucket nuevo. Valor por defecto
+            «Privado».
+          enum:
+            - private
+            - public
+          ui:enumNames:
+            - Privado (recomendado)
+            - Público (no recomendado)
+          default: private
+        artifactBucketName:
+          type: string
+          title: Nombre del bucket S3
+          description: >-
+            Obligatorio en «Crear bucket nuevo» o «Usar bucket ya existente».
+            En «Sin bucket» no aplica (se oculta).
+          default: ''
+          # Debe ir en la raíz: con allOf/if/then RJSF no siempre aplica ui:field del then.
+          ui:field: AwsS3BucketPicker
+      allOf:
+        - if:
+            properties:
+              artifactBucketMode:
+                const: create
+          then:
+            required:
+              - artifactBucketName
+              - artifactBucketAccess
+            properties:
+              artifactBucketName:
+                title: Nombre del bucket a crear
+                description: Debe ser único en todo S3 (minúsculas, 3–63 caracteres).
+              artifactBucketAccess:
+                title: Visibilidad del bucket
+                description: Recomendado mantener el bucket privado.
+        - if:
+            properties:
+              artifactBucketMode:
+                const: existing
+          then:
+            required:
+              - artifactBucketName
+            properties:
+              artifactBucketName:
+                title: Bucket S3 existente
+                description: Elige un bucket de la lista o escribe el nombre exacto.
+              artifactBucketAccess:
+                ui:widget: hidden
+        - if:
+            properties:
+              artifactBucketMode:
+                const: none
+          then:
+            properties:
+              artifactBucketAccess:
+                ui:widget: hidden
+
+  steps:
+    - id: fetch-base
+      name: Get Base Template
+      action: fetch:template
+      input:
+        url: ./skeleton/${{ parameters.language }}
+        values:
+          projectName: ${{ parameters.projectName }}
+          repositoryName: ${{ parameters.repositoryName }}
+          description: ${{ parameters.description }}
+          language: ${{ parameters.language }}
+          buildTrigger: ${{ parameters.buildTrigger }}
+          awsRegion: ${{ parameters.awsRegion }}
+          buildSteps: ${{ parameters.buildSteps }}
+          awsAccountId: ${{ parameters.awsAccountId }}
+          ecrRepositoryUri: ${{ parameters.awsAccountId }}.dkr.ecr.${{ parameters.awsRegion }}.amazonaws.com/${{ parameters.repositoryName }}
+          useS3Artifacts: ${{ parameters.artifactBucketMode != 'none' }}
+
+    - id: create-ecr
+      name: Create ECR repository
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::ECR::Repository
+        desiredState: '{"RepositoryName":"${{ parameters.repositoryName }}"}'
+        wait: true
+        maxWaitTime: 120
+
+    - id: publish
+      name: Create CodeCommit repository
+      action: aws:codecommit:publish
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        defaultBranch: main
+        gitCommitMessage: Initial AWS CI template commit
+        gitAuthorName: Backstage Scaffolder
+        gitAuthorEmail: backstage@local.dev
+        repositoryName: ${{ parameters.repositoryName }}
+        region: ${{ parameters.awsRegion }}
+
+    - id: create-artifact-bucket-private
+      name: Create S3 artifact bucket (private)
+      if: '${{ parameters.artifactBucketMode == ''create'' and parameters.artifactBucketAccess == ''private'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::S3::Bucket
+        desiredState: '{"BucketName":"${{ parameters.artifactBucketName }}","PublicAccessBlockConfiguration":{"BlockPublicAcls":true,"BlockPublicPolicy":true,"IgnorePublicAcls":true,"RestrictPublicBuckets":true},"BucketEncryption":{"ServerSideEncryptionConfiguration":[{"ServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}}'
+        wait: true
+        maxWaitTime: 120
+
+    - id: create-artifact-bucket-public
+      name: Create S3 artifact bucket (public-capable)
+      if: '${{ parameters.artifactBucketMode == ''create'' and parameters.artifactBucketAccess == ''public'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::S3::Bucket
+        desiredState: '{"BucketName":"${{ parameters.artifactBucketName }}","PublicAccessBlockConfiguration":{"BlockPublicAcls":false,"BlockPublicPolicy":false,"IgnorePublicAcls":false,"RestrictPublicBuckets":false},"BucketEncryption":{"ServerSideEncryptionConfiguration":[{"ServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}}'
+        wait: true
+        maxWaitTime: 120
+
+    - id: create-codebuild-role-with-s3
+      name: Create CodeBuild service IAM role (con S3)
+      if: '${{ parameters.artifactBucketMode == ''create'' or parameters.artifactBucketMode == ''existing'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::IAM::Role
+        desiredState: '{"RoleName":"${{ parameters.repositoryName }}-cb-role","AssumeRolePolicyDocument":{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]},"Policies":[{"PolicyName":"CodeBuildServiceAccess","PolicyDocument":{"Version":"2012-10-17","Statement":[{"Sid":"CloudWatchLogs","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":["arn:aws:logs:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:log-group:/aws/codebuild/*","arn:aws:logs:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:log-group:/aws/codebuild/*:*"]},{"Sid":"CodeBuildReports","Effect":"Allow","Action":["codebuild:CreateReportGroup","codebuild:CreateReport","codebuild:UpdateReport","codebuild:BatchPutTestCases","codebuild:BatchPutCodeCoverages"],"Resource":"*","Condition":{"StringEquals":{"aws:RequestedRegion":"${{ parameters.awsRegion }}"}}},{"Sid":"CodeCommitRead","Effect":"Allow","Action":["codecommit:GitPull","codecommit:GetBranch","codecommit:GetCommit","codecommit:GetRepository","codecommit:BatchGetRepositories"],"Resource":"arn:aws:codecommit:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:${{ parameters.repositoryName }}"},{"Sid":"ECRAuth","Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},{"Sid":"ECRRepo","Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","ecr:PutImage","ecr:InitiateLayerUpload","ecr:UploadLayerPart","ecr:CompleteLayerUpload","ecr:DescribeRepositories"],"Resource":"arn:aws:ecr:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:repository/${{ parameters.repositoryName }}"},{"Sid":"S3Artifacts","Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion","s3:PutObject","s3:PutObjectAcl","s3:ListBucket"],"Resource":["arn:aws:s3:::${{ parameters.artifactBucketName }}","arn:aws:s3:::${{ parameters.artifactBucketName }}/*"]}]}}]}'
+        wait: true
+        maxWaitTime: 180
+
+    - id: create-codebuild-role-no-s3
+      name: Create CodeBuild service IAM role (sin S3)
+      if: '${{ parameters.artifactBucketMode == ''none'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::IAM::Role
+        desiredState: '{"RoleName":"${{ parameters.repositoryName }}-cb-role","AssumeRolePolicyDocument":{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]},"Policies":[{"PolicyName":"CodeBuildServiceAccess","PolicyDocument":{"Version":"2012-10-17","Statement":[{"Sid":"CloudWatchLogs","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":["arn:aws:logs:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:log-group:/aws/codebuild/*","arn:aws:logs:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:log-group:/aws/codebuild/*:*"]},{"Sid":"CodeBuildReports","Effect":"Allow","Action":["codebuild:CreateReportGroup","codebuild:CreateReport","codebuild:UpdateReport","codebuild:BatchPutTestCases","codebuild:BatchPutCodeCoverages"],"Resource":"*","Condition":{"StringEquals":{"aws:RequestedRegion":"${{ parameters.awsRegion }}"}}},{"Sid":"CodeCommitRead","Effect":"Allow","Action":["codecommit:GitPull","codecommit:GetBranch","codecommit:GetCommit","codecommit:GetRepository","codecommit:BatchGetRepositories"],"Resource":"arn:aws:codecommit:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:${{ parameters.repositoryName }}"},{"Sid":"ECRAuth","Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},{"Sid":"ECRRepo","Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","ecr:PutImage","ecr:InitiateLayerUpload","ecr:UploadLayerPart","ecr:CompleteLayerUpload","ecr:DescribeRepositories"],"Resource":"arn:aws:ecr:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:repository/${{ parameters.repositoryName }}"}]}}]}'
+        wait: true
+        maxWaitTime: 180
+
+    - id: create-codebuild-project-with-s3
+      name: Create CodeBuild project (artefactos S3)
+      if: '${{ parameters.artifactBucketMode == ''create'' or parameters.artifactBucketMode == ''existing'' }}'
+      action: aws:codebuild:createProject
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        projectName: ${{ parameters.projectName }}
+        repositoryName: ${{ parameters.repositoryName }}
+        serviceRoleArn: arn:aws:iam::${{ parameters.awsAccountId }}:role/${{ parameters.repositoryName }}-cb-role
+        artifactsMode: S3
+        artifactBucketName: ${{ parameters.artifactBucketName }}
+
+    - id: create-codebuild-project-no-s3
+      name: Create CodeBuild project (sin artefactos S3)
+      if: '${{ parameters.artifactBucketMode == ''none'' }}'
+      action: aws:codebuild:createProject
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        projectName: ${{ parameters.projectName }}
+        repositoryName: ${{ parameters.repositoryName }}
+        serviceRoleArn: arn:aws:iam::${{ parameters.awsAccountId }}:role/${{ parameters.repositoryName }}-cb-role
+        artifactsMode: NO_ARTIFACTS
+
+    - id: record-resource
+      name: Record resource metadata in Backstage
+      action: internal:resources:record
+      input:
+        platform: aws
+        resourceType: repository
+        name: ${{ parameters.repositoryName }}
+        language: ${{ parameters.language }}
+        region: ${{ parameters.awsRegion }}
+        accountId: ${{ parameters.awsAccountId }}
+        owner: platform-team
+        links:
+          - ${{ steps['publish'].output.cloneUrlHttp }}
+          - https://${{ parameters.awsRegion }}.console.aws.amazon.com/ecr/repositories/private/${{ parameters.awsAccountId }}/${{ parameters.repositoryName }}?region=${{ parameters.awsRegion }}
+          - https://${{ parameters.awsRegion }}.console.aws.amazon.com/codesuite/codebuild/projects/${{ parameters.projectName }}/history?region=${{ parameters.awsRegion }}
+        metadata:
+          template: aws-codebuild-ci-pipeline
+          ecrResourceId: ${{ steps['create-ecr'].output.identifier }}
+          codeBuildProjectName: ${{ parameters.projectName }}
+          codeBuildServiceRoleName: ${{ parameters.repositoryName }}-cb-role
+          artifactBucketMode: ${{ parameters.artifactBucketMode }}
+          artifactBucketName: ${{ parameters.artifactBucketName }}
+          artifactBucketAccess: ${{ parameters.artifactBucketAccess }}
+          buildSteps: ${{ parameters.buildSteps }}
+          createdFiles:
+            - Dockerfile
+            - buildspec.yml
+            - catalog-info.yaml
+            - README.md
+
+  output:
+    links:
+      - title: CodeCommit repository (HTTP)
+        url: ${{ steps['publish'].output.cloneUrlHttp }}
+      - title: ECR repository (console)
+        url: https://${{ parameters.awsRegion }}.console.aws.amazon.com/ecr/repositories/private/${{ parameters.awsAccountId }}/${{ parameters.repositoryName }}?region=${{ parameters.awsRegion }}
+      - title: CodeBuild project
+        url: https://${{ parameters.awsRegion }}.console.aws.amazon.com/codesuite/codebuild/projects/${{ parameters.projectName }}/history?region=${{ parameters.awsRegion }}
+      - title: CodePipeline (optional)
+        url: https://${{ parameters.awsRegion }}.console.aws.amazon.com/codesuite/codepipeline/home?region=${{ parameters.awsRegion }}
+    text:
+      - title: Recursos creados
+        content: |
+          **CodeCommit:** `${{ steps['publish'].output.cloneUrlHttp }}`
+
+          **ECR:** `${{ parameters.awsAccountId }}.dkr.ecr.${{ parameters.awsRegion }}.amazonaws.com/${{ parameters.repositoryName }}`
+
+          **CodeBuild:** proyecto `${{ parameters.projectName }}` (origen CodeCommit `${{ parameters.repositoryName }}`, rama `main`, imagen `aws/codebuild/amazonlinux-x86_64-standard:6.0`, `buildspec.yml` en la raíz del repo).
+
+          **S3:** modo **${{ parameters.artifactBucketMode }}** — bucket (si aplica): `${{ parameters.artifactBucketName }}`.
+
+          **Rol IAM del proyecto:** `arn:aws:iam::${{ parameters.awsAccountId }}:role/${{ parameters.repositoryName }}-cb-role` (permisos S3 si el modo no es `none`).
+
+          **Notas:** Imagen administrada `amazonlinux-x86_64-standard:6.0`, entorno `LINUX_CONTAINER`, `PrivilegedMode` activo para builds con Docker.
+
+          **IAM (usuario de Backstage):** Cloud Control para ECR, IAM y bucket S3; `codebuild:CreateProject` para el proyecto CodeBuild; además `s3:ListBuckets` y creación de bucket solo en modo `create`.
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: aws-codebuild-ci-pipeline
+  title: AWS CodeCommit + CodeBuild CI Pipeline
+  description: >-
+    Crea CodeCommit, ECR, rol IAM y proyecto CodeBuild (CodeCommit, rama main,
+    imagen amazonlinux-x86_64-standard:6.0). Opcionalmente crea un bucket S3
+    para artefactos; si no, el proyecto CodeBuild queda sin artefactos S3
+    (NO_ARTIFACTS). El usuario IAM de Backstage necesita permisos Cloud Control
+    (ECR, IAM, S3), codebuild:CreateProject para el proyecto, y para roles
+    acciones como iam:GetRole e iam:CreateRole sobre el rol del proyecto
+    (p. ej. <repo>-cb-role).
+  tags:
+    - idp-cloud-aws
+    - aws
+    - ci-cd
+    - docker
+    - ecr
+    - codebuild
+spec:
+  owner: platform-team
+  type: pipeline
+
+  parameters:
+    - title: Project Information
+      required:
+        - projectName
+        - repositoryName
+        - language
+      properties:
+        projectName:
+          title: Project Name
+          type: string
+          description: >-
+            Nombre del proyecto CodeBuild (sin espacios; alfanumérico, guiones
+            y guiones bajos; 2–150 caracteres según AWS).
+          ui:autofocus: true
+          pattern: '^[A-Za-z0-9][A-Za-z0-9\-_]{1,149}$'
+        repositoryName:
+          title: Repository Name
+          type: string
+          description: >-
+            Nombre para CodeCommit y ECR (reglas de naming de AWS para ambos).
+          maxLength: 100
+          pattern: '^[a-zA-Z0-9._-]+$'
+        description:
+          title: Description
+          type: string
+          description: Short pipeline description
+          ui:widget: textarea
+          ui:options:
+            minRows: 3
+        language:
+          title: Programming Language
+          type: string
+          description: Main project language
+          enum:
+            - nodejs
+            - csharp
+            - java
+            - python
+          ui:enumNames:
+            - Node.js
+            - C#/.NET
+            - Java
+            - Python
+
+    - title: Pipeline Configuration
+      required:
+        - buildTrigger
+        - buildSteps
+      properties:
+        buildTrigger:
+          title: Build Trigger
+          type: string
+          description: >-
+            Rama principal esperada en CodeCommit (el proyecto CodeBuild usa
+            rama main como referencia de origen).
+          enum:
+            - main
+            - develop
+            - feature/*
+            - manual
+          ui:enumNames:
+            - Push to main
+            - Push to develop
+            - Push to feature branches
+            - Manual only
+          default: main
+        buildSteps:
+          title: Build Steps
+          type: array
+          description: Select the steps your pipeline requires
+          items:
+            type: string
+            enum:
+              - install-dependencies
+              - run-tests
+              - build-application
+              - security-scan
+              - docker-build
+              - publish-artifacts
+          uniqueItems: true
+          default: ["install-dependencies", "run-tests", "build-application"]
+
+    - title: AWS Configuration
+      required:
+        - awsAccountId
+        - awsRegion
+        - artifactBucketMode
+      properties:
+        awsAccountId:
+          title: AWS Account ID
+          type: string
+          description: >-
+            Escribe solo los 12 dígitos del ID de cuenta (sin espacios ni URLs).
+          minLength: 12
+          maxLength: 12
+          pattern: '^[0-9]{12}$'
+        awsRegion:
+          title: AWS Region
+          type: string
+          description: Región para CodeCommit, ECR, S3, IAM y CodeBuild (también para listar buckets)
+          default: us-east-2
+        artifactBucketMode:
+          title: Artefactos de CodeBuild en S3
+          type: string
+          description: >-
+            Crear bucket: Backstage crea el bucket (requiere permisos S3 en el
+            usuario del backend). Sin bucket: proyecto sin artefactos S3
+            (NO_ARTIFACTS). Usar existente: eliges un bucket de la lista (API
+            ListBuckets con credenciales del backend).
+          enum:
+            - create
+            - none
+            - existing
+          ui:enumNames:
+            - Crear bucket nuevo
+            - Sin bucket (NO_ARTIFACTS)
+            - Usar bucket ya existente
+          ui:widget: radio
+          default: none
+        artifactBucketAccess:
+          type: string
+          title: Visibilidad del bucket (solo al crear uno nuevo)
+          description: >-
+            Solo se usa si eliges crear un bucket nuevo. Valor por defecto
+            «Privado».
+          enum:
+            - private
+            - public
+          ui:enumNames:
+            - Privado (recomendado)
+            - Público (no recomendado)
+          default: private
+        artifactBucketName:
+          type: string
+          title: Nombre del bucket S3
+          description: >-
+            Obligatorio en «Crear bucket nuevo» o «Usar bucket ya existente».
+            En «Sin bucket» no aplica (se oculta).
+          default: ''
+          # Debe ir en la raíz: con allOf/if/then RJSF no siempre aplica ui:field del then.
+          ui:field: AwsS3BucketPicker
+      allOf:
+        - if:
+            properties:
+              artifactBucketMode:
+                const: create
+          then:
+            required:
+              - artifactBucketName
+              - artifactBucketAccess
+            properties:
+              artifactBucketName:
+                title: Nombre del bucket a crear
+                description: Debe ser único en todo S3 (minúsculas, 3–63 caracteres).
+              artifactBucketAccess:
+                title: Visibilidad del bucket
+                description: Recomendado mantener el bucket privado.
+        - if:
+            properties:
+              artifactBucketMode:
+                const: existing
+          then:
+            required:
+              - artifactBucketName
+            properties:
+              artifactBucketName:
+                title: Bucket S3 existente
+                description: Elige un bucket de la lista o escribe el nombre exacto.
+              artifactBucketAccess:
+                ui:widget: hidden
+        - if:
+            properties:
+              artifactBucketMode:
+                const: none
+          then:
+            properties:
+              artifactBucketAccess:
+                ui:widget: hidden
+
+  steps:
+    - id: fetch-base
+      name: Get Base Template
+      action: fetch:template
+      input:
+        url: ./skeleton/${{ parameters.language }}
+        values:
+          projectName: ${{ parameters.projectName }}
+          repositoryName: ${{ parameters.repositoryName }}
+          description: ${{ parameters.description }}
+          language: ${{ parameters.language }}
+          buildTrigger: ${{ parameters.buildTrigger }}
+          awsRegion: ${{ parameters.awsRegion }}
+          buildSteps: ${{ parameters.buildSteps }}
+          awsAccountId: ${{ parameters.awsAccountId }}
+          ecrRepositoryUri: ${{ parameters.awsAccountId }}.dkr.ecr.${{ parameters.awsRegion }}.amazonaws.com/${{ parameters.repositoryName }}
+          useS3Artifacts: ${{ parameters.artifactBucketMode != 'none' }}
+
+    - id: create-ecr
+      name: Create ECR repository
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::ECR::Repository
+        desiredState: '{"RepositoryName":"${{ parameters.repositoryName }}"}'
+        wait: true
+        maxWaitTime: 120
+
+    - id: publish
+      name: Create CodeCommit repository
+      action: aws:codecommit:publish
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        defaultBranch: main
+        gitCommitMessage: Initial AWS CI template commit
+        gitAuthorName: Backstage Scaffolder
+        gitAuthorEmail: backstage@local.dev
+        repositoryName: ${{ parameters.repositoryName }}
+        region: ${{ parameters.awsRegion }}
+
+    - id: create-artifact-bucket-private
+      name: Create S3 artifact bucket (private)
+      if: '${{ parameters.artifactBucketMode == ''create'' and parameters.artifactBucketAccess == ''private'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::S3::Bucket
+        desiredState: '{"BucketName":"${{ parameters.artifactBucketName }}","PublicAccessBlockConfiguration":{"BlockPublicAcls":true,"BlockPublicPolicy":true,"IgnorePublicAcls":true,"RestrictPublicBuckets":true},"BucketEncryption":{"ServerSideEncryptionConfiguration":[{"ServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}}'
+        wait: true
+        maxWaitTime: 120
+
+    - id: create-artifact-bucket-public
+      name: Create S3 artifact bucket (public-capable)
+      if: '${{ parameters.artifactBucketMode == ''create'' and parameters.artifactBucketAccess == ''public'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::S3::Bucket
+        desiredState: '{"BucketName":"${{ parameters.artifactBucketName }}","PublicAccessBlockConfiguration":{"BlockPublicAcls":false,"BlockPublicPolicy":false,"IgnorePublicAcls":false,"RestrictPublicBuckets":false},"BucketEncryption":{"ServerSideEncryptionConfiguration":[{"ServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}}'
+        wait: true
+        maxWaitTime: 120
+
+    - id: create-codebuild-role-with-s3
+      name: Create CodeBuild service IAM role (con S3)
+      if: '${{ parameters.artifactBucketMode == ''create'' or parameters.artifactBucketMode == ''existing'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::IAM::Role
+        desiredState: '{"RoleName":"${{ parameters.repositoryName }}-cb-role","AssumeRolePolicyDocument":{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]},"Policies":[{"PolicyName":"CodeBuildServiceAccess","PolicyDocument":{"Version":"2012-10-17","Statement":[{"Sid":"CloudWatchLogs","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":["arn:aws:logs:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:log-group:/aws/codebuild/*","arn:aws:logs:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:log-group:/aws/codebuild/*:*"]},{"Sid":"CodeBuildReports","Effect":"Allow","Action":["codebuild:CreateReportGroup","codebuild:CreateReport","codebuild:UpdateReport","codebuild:BatchPutTestCases","codebuild:BatchPutCodeCoverages"],"Resource":"*","Condition":{"StringEquals":{"aws:RequestedRegion":"${{ parameters.awsRegion }}"}}},{"Sid":"CodeCommitRead","Effect":"Allow","Action":["codecommit:GitPull","codecommit:GetBranch","codecommit:GetCommit","codecommit:GetRepository","codecommit:BatchGetRepositories"],"Resource":"arn:aws:codecommit:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:${{ parameters.repositoryName }}"},{"Sid":"ECRAuth","Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},{"Sid":"ECRRepo","Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","ecr:PutImage","ecr:InitiateLayerUpload","ecr:UploadLayerPart","ecr:CompleteLayerUpload","ecr:DescribeRepositories"],"Resource":"arn:aws:ecr:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:repository/${{ parameters.repositoryName }}"},{"Sid":"S3Artifacts","Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion","s3:PutObject","s3:PutObjectAcl","s3:ListBucket"],"Resource":["arn:aws:s3:::${{ parameters.artifactBucketName }}","arn:aws:s3:::${{ parameters.artifactBucketName }}/*"]}]}}]}'
+        wait: true
+        maxWaitTime: 180
+
+    - id: create-codebuild-role-no-s3
+      name: Create CodeBuild service IAM role (sin S3)
+      if: '${{ parameters.artifactBucketMode == ''none'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::IAM::Role
+        desiredState: '{"RoleName":"${{ parameters.repositoryName }}-cb-role","AssumeRolePolicyDocument":{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]},"Policies":[{"PolicyName":"CodeBuildServiceAccess","PolicyDocument":{"Version":"2012-10-17","Statement":[{"Sid":"CloudWatchLogs","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":["arn:aws:logs:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:log-group:/aws/codebuild/*","arn:aws:logs:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:log-group:/aws/codebuild/*:*"]},{"Sid":"CodeBuildReports","Effect":"Allow","Action":["codebuild:CreateReportGroup","codebuild:CreateReport","codebuild:UpdateReport","codebuild:BatchPutTestCases","codebuild:BatchPutCodeCoverages"],"Resource":"*","Condition":{"StringEquals":{"aws:RequestedRegion":"${{ parameters.awsRegion }}"}}},{"Sid":"CodeCommitRead","Effect":"Allow","Action":["codecommit:GitPull","codecommit:GetBranch","codecommit:GetCommit","codecommit:GetRepository","codecommit:BatchGetRepositories"],"Resource":"arn:aws:codecommit:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:${{ parameters.repositoryName }}"},{"Sid":"ECRAuth","Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},{"Sid":"ECRRepo","Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","ecr:PutImage","ecr:InitiateLayerUpload","ecr:UploadLayerPart","ecr:CompleteLayerUpload","ecr:DescribeRepositories"],"Resource":"arn:aws:ecr:${{ parameters.awsRegion }}:${{ parameters.awsAccountId }}:repository/${{ parameters.repositoryName }}"}]}}]}'
+        wait: true
+        maxWaitTime: 180
+
+    - id: create-codebuild-project-with-s3
+      name: Create CodeBuild project (artefactos S3)
+      if: '${{ parameters.artifactBucketMode == ''create'' or parameters.artifactBucketMode == ''existing'' }}'
+      action: aws:codebuild:createProject
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        projectName: ${{ parameters.projectName }}
+        repositoryName: ${{ parameters.repositoryName }}
+        serviceRoleArn: arn:aws:iam::${{ parameters.awsAccountId }}:role/${{ parameters.repositoryName }}-cb-role
+        artifactsMode: S3
+        artifactBucketName: ${{ parameters.artifactBucketName }}
+
+    - id: create-codebuild-project-no-s3
+      name: Create CodeBuild project (sin artefactos S3)
+      if: '${{ parameters.artifactBucketMode == ''none'' }}'
+      action: aws:codebuild:createProject
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        projectName: ${{ parameters.projectName }}
+        repositoryName: ${{ parameters.repositoryName }}
+        serviceRoleArn: arn:aws:iam::${{ parameters.awsAccountId }}:role/${{ parameters.repositoryName }}-cb-role
+        artifactsMode: NO_ARTIFACTS
+
+    - id: record-resource
+      name: Record resource metadata in Backstage
+      action: internal:resources:record
+      input:
+        platform: aws
+        resourceType: repository
+        name: ${{ parameters.repositoryName }}
+        language: ${{ parameters.language }}
+        region: ${{ parameters.awsRegion }}
+        accountId: ${{ parameters.awsAccountId }}
+        owner: platform-team
+        links:
+          - ${{ steps['publish'].output.cloneUrlHttp }}
+          - https://${{ parameters.awsRegion }}.console.aws.amazon.com/ecr/repositories/private/${{ parameters.awsAccountId }}/${{ parameters.repositoryName }}?region=${{ parameters.awsRegion }}
+          - https://${{ parameters.awsRegion }}.console.aws.amazon.com/codesuite/codebuild/projects/${{ parameters.projectName }}/history?region=${{ parameters.awsRegion }}
+        metadata:
+          template: aws-codebuild-ci-pipeline
+          ecrResourceId: ${{ steps['create-ecr'].output.identifier }}
+          codeBuildProjectName: ${{ parameters.projectName }}
+          codeBuildServiceRoleName: ${{ parameters.repositoryName }}-cb-role
+          artifactBucketMode: ${{ parameters.artifactBucketMode }}
+          artifactBucketName: ${{ parameters.artifactBucketName }}
+          artifactBucketAccess: ${{ parameters.artifactBucketAccess }}
+          buildSteps: ${{ parameters.buildSteps }}
+          createdFiles:
+            - Dockerfile
+            - buildspec.yml
+            - catalog-info.yaml
+            - README.md
+
+  output:
+    links:
+      - title: CodeCommit repository (HTTP)
+        url: ${{ steps['publish'].output.cloneUrlHttp }}
+      - title: ECR repository (console)
+        url: https://${{ parameters.awsRegion }}.console.aws.amazon.com/ecr/repositories/private/${{ parameters.awsAccountId }}/${{ parameters.repositoryName }}?region=${{ parameters.awsRegion }}
+      - title: CodeBuild project
+        url: https://${{ parameters.awsRegion }}.console.aws.amazon.com/codesuite/codebuild/projects/${{ parameters.projectName }}/history?region=${{ parameters.awsRegion }}
+      - title: CodePipeline (optional)
+        url: https://${{ parameters.awsRegion }}.console.aws.amazon.com/codesuite/codepipeline/home?region=${{ parameters.awsRegion }}
+    text:
+      - title: Recursos creados
+        content: |
+          **CodeCommit:** `${{ steps['publish'].output.cloneUrlHttp }}`
+
+          **ECR:** `${{ parameters.awsAccountId }}.dkr.ecr.${{ parameters.awsRegion }}.amazonaws.com/${{ parameters.repositoryName }}`
+
+          **CodeBuild:** proyecto `${{ parameters.projectName }}` (origen CodeCommit `${{ parameters.repositoryName }}`, rama `main`, imagen `aws/codebuild/amazonlinux-x86_64-standard:6.0`, `buildspec.yml` en la raíz del repo).
+
+          **S3:** modo **${{ parameters.artifactBucketMode }}** — bucket (si aplica): `${{ parameters.artifactBucketName }}`.
+
+          **Rol IAM del proyecto:** `arn:aws:iam::${{ parameters.awsAccountId }}:role/${{ parameters.repositoryName }}-cb-role` (permisos S3 si el modo no es `none`).
+
+          **Notas:** Imagen administrada `amazonlinux-x86_64-standard:6.0`, entorno `LINUX_CONTAINER`, `PrivilegedMode` activo para builds con Docker.
+
+          **IAM (usuario de Backstage):** Cloud Control para ECR, IAM y bucket S3; `codebuild:CreateProject` para el proyecto CodeBuild; además `s3:ListBuckets` y creación de bucket solo en modo `create`.
