@@ -1,0 +1,167 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: aws-s3-bucket
+  title: AWS S3 Bucket
+  description: >-
+    Crea un bucket S3 con acceso publico o privado, versionado y cifrado.
+    Los buckets publicos incluyen politica de bucket (s3:GetObject) porque con
+    Object Ownership enforced las ACL no permiten lectura anonima.
+  tags:
+    - idp-cloud-aws
+    - aws
+    - s3
+    - bucket
+spec:
+  owner: group:devops
+  type: infrastructure
+
+  parameters:
+    - title: Configuracion general
+      required:
+        - bucketName
+        - awsAccountId
+        - awsRegion
+        - bucketAccess
+      properties:
+        bucketName:
+          title: Nombre del bucket
+          type: string
+          pattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+          ui:autofocus: true
+        awsAccountId:
+          title: AWS Account ID
+          type: string
+          minLength: 12
+          maxLength: 12
+          pattern: '^[0-9]{12}$'
+        awsRegion:
+          title: AWS Region
+          type: string
+          default: us-east-2
+        bucketAccess:
+          title: Visibilidad del bucket
+          type: string
+          enum:
+            - private
+            - public
+          ui:enumNames:
+            - Privado (recomendado)
+            - Publico
+          default: private
+        versioningEnabled:
+          title: Activar versionado
+          type: string
+          enum:
+            - 'yes'
+            - 'no'
+          default: 'yes'
+          ui:enumNames:
+            - Si
+            - 'No'
+        encryptionType:
+          title: Cifrado del bucket
+          type: string
+          enum:
+            - AES256
+            - aws:kms
+          default: AES256
+        kmsKeyId:
+          title: KMS Key ID o ARN
+          type: string
+          default: ''
+
+  steps:
+    - id: create-s3-bucket-private
+      name: Crear bucket privado
+      if: '${{ parameters.bucketAccess == ''private'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::S3::Bucket
+        desiredState: >-
+          {"BucketName":"${{ parameters.bucketName }}","PublicAccessBlockConfiguration":{"BlockPublicAcls":true,"BlockPublicPolicy":true,"IgnorePublicAcls":true,"RestrictPublicBuckets":true},"VersioningConfiguration":{"Status":"${{ 'Enabled' if parameters.versioningEnabled == 'yes' else 'Suspended' }}"},"BucketEncryption":{"ServerSideEncryptionConfiguration":[{"ServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}}
+        wait: true
+        maxWaitTime: 300
+
+    - id: create-s3-bucket-public
+      name: Crear bucket publico
+      if: '${{ parameters.bucketAccess == ''public'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::S3::Bucket
+        desiredState: >-
+          {"BucketName":"${{ parameters.bucketName }}","PublicAccessBlockConfiguration":{"BlockPublicAcls":false,"BlockPublicPolicy":false,"IgnorePublicAcls":false,"RestrictPublicBuckets":false},"VersioningConfiguration":{"Status":"${{ 'Enabled' if parameters.versioningEnabled == 'yes' else 'Suspended' }}"},"BucketEncryption":{"ServerSideEncryptionConfiguration":[{"ServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}}
+        wait: true
+        maxWaitTime: 300
+
+    - id: attach-public-read-bucket-policy
+      name: Aplicar politica de lectura publica
+      if: '${{ parameters.bucketAccess == ''public'' }}'
+      action: aws:cloudcontrol:create
+      input:
+        accountId: ${{ parameters.awsAccountId }}
+        region: ${{ parameters.awsRegion }}
+        typeName: AWS::S3::BucketPolicy
+        desiredState: >-
+          {"Bucket":"${{ parameters.bucketName }}","PolicyDocument":{"Version":"2012-10-17","Statement":[{"Sid":"PublicReadObjects","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::${{ parameters.bucketName }}/*"}]}}
+        wait: true
+        maxWaitTime: 120
+
+    - id: record-resource
+      name: Registrar recurso
+      action: internal:resources:record
+      input:
+        platform: aws
+        resourceType: s3-bucket
+        name: ${{ parameters.bucketName }}
+        region: ${{ parameters.awsRegion }}
+        accountId: ${{ parameters.awsAccountId }}
+        owner: group:devops
+        metadata:
+          bucketAccess: ${{ parameters.bucketAccess }}
+          bucketUri: s3://${{ parameters.bucketName }}/
+          bucketArn: arn:aws:s3:::${{ parameters.bucketName }}
+          privateUri: s3://${{ parameters.bucketName }}/
+          publicUrl: https://${{ parameters.bucketName }}.s3.${{ parameters.awsRegion }}.amazonaws.com/
+          publicReadPolicy: ${{ parameters.bucketAccess == 'public' }}
+
+  output:
+    links:
+      - title: Consola S3 — bucket
+        url: https://${{ parameters.awsRegion }}.console.aws.amazon.com/s3/buckets/${{ parameters.bucketName }}?region=${{ parameters.awsRegion }}
+      - title: URI S3 (bucket)
+        url: s3://${{ parameters.bucketName }}/
+      - title: URL pública (HTTP)
+        if: ${{ parameters.bucketAccess == 'public' }}
+        url: https://${{ parameters.bucketName }}.s3.${{ parameters.awsRegion }}.amazonaws.com/
+    text:
+      - title: Rutas del bucket
+        content: |
+          **Ruta del bucket (URI S3)**
+          `s3://${{ parameters.bucketName }}/`
+
+          **ARN**
+          `arn:aws:s3:::${{ parameters.bucketName }}`
+
+          **Ruta privada** — acceso con credenciales AWS / IAM (CLI, SDK, consola autenticada)
+          `s3://${{ parameters.bucketName }}/`
+
+          **Región:** `${{ parameters.awsRegion }}` · **Cuenta:** `${{ parameters.awsAccountId }}` · **Visibilidad:** `${{ parameters.bucketAccess }}`
+      - title: Ruta pública (HTTP)
+        if: ${{ parameters.bucketAccess == 'public' }}
+        content: |
+          `https://${{ parameters.bucketName }}.s3.${{ parameters.awsRegion }}.amazonaws.com/<clave-del-objeto>`
+
+          Se aplicó la política **PublicReadObjects** (`s3:GetObject` para `Principal: *`). Con *Bucket owner enforced* las ACL no dan lectura pública; la política de bucket es obligatoria.
+
+          Ejemplo de objeto: `https://${{ parameters.bucketName }}.s3.${{ parameters.awsRegion }}.amazonaws.com/mi-archivo.png`
+
+          Evita espacios en nombres de archivo (usan `%20` en la URL).
+      - title: Ruta pública (HTTP)
+        if: ${{ parameters.bucketAccess == 'private' }}
+        content: |
+          _No aplica — el bucket es privado (Block Public Access activo)._
